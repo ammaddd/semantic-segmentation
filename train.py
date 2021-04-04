@@ -30,6 +30,9 @@ POSSIBILITY OF SUCH DAMAGE.
 from __future__ import absolute_import
 from __future__ import division
 
+from comet_ml import Experiment
+from pandas.io.json._normalize import nested_to_record
+
 import argparse
 import os
 import sys
@@ -332,6 +335,7 @@ def main():
     logx.initialize(logdir=args.result_dir,
                     tensorboard=True, hparams=vars(args),
                     global_rank=args.global_rank)
+    experiment = Experiment(auto_metric_logging=False)
 
     # Set up the Arguments, Tensorboard Writer, Dataloader, Loss Fn, Optimizer
     assert_and_infer_cfg(args)
@@ -428,6 +432,11 @@ def main():
     elif args.eval is not None:
         raise 'unknown eval option {}'.format(args.eval)
 
+    settings_dict = nested_to_record(vars(args), sep='_')
+    experiment.log_others(settings_dict)
+    experiment.log_code("config.py")
+    experiment.log_code("datasets/cityscapes.py")
+
     for epoch in range(args.start_epoch, args.max_epoch):
         update_epoch(epoch)
 
@@ -448,13 +457,13 @@ def main():
         else:
             pass
 
-        train(train_loader, net, optim, epoch)
+        train(train_loader, net, optim, epoch, experiment)
 
         if args.apex:
             train_loader.sampler.set_epoch(epoch + 1)
 
         if epoch % args.val_freq == 0:
-            validate(val_loader, net, criterion_val, optim, epoch)
+            validate(val_loader, net, criterion_val, optim, epoch, experiment=experiment)
 
         scheduler.step()
 
@@ -462,7 +471,7 @@ def main():
             return 0
 
 
-def train(train_loader, net, optim, curr_epoch):
+def train(train_loader, net, optim, curr_epoch, experiment):
     """
     Runs the training loop per epoch
     train_loader: Data loader for train
@@ -486,6 +495,17 @@ def train(train_loader, net, optim, curr_epoch):
         batch_pixel_size = images.size(0) * images.size(2) * images.size(3)
         images, gts, scale_float = images.cuda(), gts.cuda(), scale_float.cuda()
         inputs = {'images': images, 'gts': gts}
+        curr_iter = curr_epoch * len(train_loader) + i
+
+        if i % 200 == 0:
+            experiment.log_image(images[0].detach().cpu().numpy(),
+                                 name='train_images',
+                                 image_channels="first",
+                                 step=curr_iter)
+            experiment.log_image(gts[0].detach().cpu().numpy(),
+                                 name='train_gt',
+                                 image_channels="first",
+                                 step=curr_iter)
 
         optim.zero_grad()
         main_loss = net(inputs)
@@ -524,8 +544,8 @@ def train(train_loader, net, optim, curr_epoch):
 
         metrics = {'loss': train_main_loss.avg,
                    'lr': optim.param_groups[-1]['lr']}
-        curr_iter = curr_epoch * len(train_loader) + i
         logx.metric('train', metrics, curr_iter)
+        experiment.log_metrics(metrics, step=curr_iter, epoch=curr_epoch)
 
         if i >= 10 and args.test_mode:
             del data, inputs, gts
@@ -536,7 +556,8 @@ def train(train_loader, net, optim, curr_epoch):
 def validate(val_loader, net, criterion, optim, epoch,
              calc_metrics=True,
              dump_assets=False,
-             dump_all_images=False):
+             dump_all_images=False,
+             experiment=None):
     """
     Run validation for one epoch
 
@@ -595,6 +616,8 @@ def validate(val_loader, net, criterion, optim, epoch,
     # Write out a summary html page and tensorboard image table
     if not args.dump_for_auto_labelling and not args.dump_for_submission:
         dumper.write_summaries(was_best)
+
+    experiment.log_metric('val_iou_acc', iou_acc, epoch=epoch)
 
 
 if __name__ == '__main__':
