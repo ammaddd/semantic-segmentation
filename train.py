@@ -30,6 +30,9 @@ POSSIBILITY OF SUCH DAMAGE.
 from __future__ import absolute_import
 from __future__ import division
 
+from utils.comet_utils import CometLogger
+from pandas.io.json._normalize import nested_to_record
+
 import argparse
 import os
 import sys
@@ -268,7 +271,8 @@ parser.add_argument('--supervised_mscale_loss_wt', type=float, default=None,
                     help='weighting for the supervised loss')
 parser.add_argument('--ocr_aux_loss_rmi', action='store_true', default=False,
                     help='allow rmi for aux loss')
-
+parser.add_argument('--comet', default=False, type=bool,
+                    help='enable comet logging (if comet installed)')
 
 args = parser.parse_args()
 args.best_record = {'epoch': -1, 'iter': 0, 'val_loss': 1e10, 'acc': 0,
@@ -332,6 +336,7 @@ def main():
     logx.initialize(logdir=args.result_dir,
                     tensorboard=True, hparams=vars(args),
                     global_rank=args.global_rank)
+    comet_logger = CometLogger(args.comet, auto_metric_logging=False)
 
     # Set up the Arguments, Tensorboard Writer, Dataloader, Loss Fn, Optimizer
     assert_and_infer_cfg(args)
@@ -428,6 +433,11 @@ def main():
     elif args.eval is not None:
         raise 'unknown eval option {}'.format(args.eval)
 
+    settings_dict = nested_to_record(vars(args), sep='_')
+    comet_logger.log_others(settings_dict)
+    comet_logger.log_code("config.py")
+    comet_logger.log_code("datasets/cityscapes.py")
+
     for epoch in range(args.start_epoch, args.max_epoch):
         update_epoch(epoch)
 
@@ -448,13 +458,13 @@ def main():
         else:
             pass
 
-        train(train_loader, net, optim, epoch)
+        train(train_loader, net, optim, epoch, comet_logger)
 
         if args.apex:
             train_loader.sampler.set_epoch(epoch + 1)
 
         if epoch % args.val_freq == 0:
-            validate(val_loader, net, criterion_val, optim, epoch)
+            validate(val_loader, net, criterion_val, optim, epoch, comet_logger=comet_logger)
 
         scheduler.step()
 
@@ -462,7 +472,7 @@ def main():
             return 0
 
 
-def train(train_loader, net, optim, curr_epoch):
+def train(train_loader, net, optim, curr_epoch, comet_logger):
     """
     Runs the training loop per epoch
     train_loader: Data loader for train
@@ -486,6 +496,17 @@ def train(train_loader, net, optim, curr_epoch):
         batch_pixel_size = images.size(0) * images.size(2) * images.size(3)
         images, gts, scale_float = images.cuda(), gts.cuda(), scale_float.cuda()
         inputs = {'images': images, 'gts': gts}
+        curr_iter = curr_epoch * len(train_loader) + i
+
+        if i % 200 == 0:
+            comet_logger.log_image(images[0].detach().cpu().numpy(),
+                                   name='train_images',
+                                   image_channels="first",
+                                   step=curr_iter)
+            comet_logger.log_image(gts[0].detach().cpu().numpy(),
+                                   name='train_gt',
+                                   image_channels="first",
+                                   step=curr_iter)
 
         optim.zero_grad()
         main_loss = net(inputs)
@@ -524,8 +545,8 @@ def train(train_loader, net, optim, curr_epoch):
 
         metrics = {'loss': train_main_loss.avg,
                    'lr': optim.param_groups[-1]['lr']}
-        curr_iter = curr_epoch * len(train_loader) + i
         logx.metric('train', metrics, curr_iter)
+        comet_logger.log_metrics(metrics, step=curr_iter, epoch=curr_epoch)
 
         if i >= 10 and args.test_mode:
             del data, inputs, gts
@@ -536,7 +557,8 @@ def train(train_loader, net, optim, curr_epoch):
 def validate(val_loader, net, criterion, optim, epoch,
              calc_metrics=True,
              dump_assets=False,
-             dump_all_images=False):
+             dump_all_images=False,
+             comet_logger=None):
     """
     Run validation for one epoch
 
@@ -595,6 +617,8 @@ def validate(val_loader, net, criterion, optim, epoch,
     # Write out a summary html page and tensorboard image table
     if not args.dump_for_auto_labelling and not args.dump_for_submission:
         dumper.write_summaries(was_best)
+
+    comet_logger.log_metric('val_iou_acc', iou_acc, epoch=epoch)
 
 
 if __name__ == '__main__':
